@@ -19,6 +19,8 @@ Agentcore 是编码 Agent 的**认知核心**：提供 Go 实现和一个行为�
 
 ## 使用
 
+完整的公开接口、事件协议、审批与恢复示例见 [接口文档](API.md)。
+
 ```go
 provider := openai.New(baseURL, apiKey, model, "responses", "medium")
 brain := agent.New(provider, toolbox, systemPrompt)
