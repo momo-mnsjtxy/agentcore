@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/momo-mnsjtxy/agentcore/model"
 )
@@ -26,24 +27,25 @@ const (
 type EventKind string
 
 const (
-	Delta        EventKind = "delta"
-	Reasoning    EventKind = "reasoning"
-	MessageDone  EventKind = "message_done"
-	Approval     EventKind = "approval"
-	ToolStarted  EventKind = "tool_started"
-	ToolDone     EventKind = "tool_done"
-	UsageChanged EventKind = "usage_changed"
+	Delta         EventKind = "delta"
+	Reasoning     EventKind = "reasoning"
+	MessageDone   EventKind = "message_done"
+	Approval      EventKind = "approval"
+	ToolStarted   EventKind = "tool_started"
+	ToolDone      EventKind = "tool_done"
+	UsageChanged  EventKind = "usage_changed"
 	Clarification EventKind = "clarification"
-	Finished     EventKind = "finished"
-	Failed       EventKind = "failed"
+	Paused        EventKind = "paused"
+	Finished      EventKind = "finished"
+	Failed        EventKind = "failed"
 )
 
 // Event 是认知循环向界面发送的一次变化。
 type Event struct {
-	Kind  EventKind
-	Text  string
-	Call  model.ToolCall
-	Usage model.Usage
+	Kind   EventKind
+	Text   string
+	Call   model.ToolCall
+	Usage  model.Usage
 	Failed bool
 }
 
@@ -61,12 +63,36 @@ type Stats struct {
 	Tools     int
 	Approvals int
 	Failures  int
+	Goal      string
+	Status    RunStatus
 }
+
+// RunStatus describes the durable lifecycle state of a session.
+type RunStatus string
+
+const (
+	StatusIdle     RunStatus = "idle"
+	StatusRunning  RunStatus = "running"
+	StatusPaused   RunStatus = "paused"
+	StatusFinished RunStatus = "finished"
+	StatusFailed   RunStatus = "failed"
+)
 
 // Snapshot 是可持久化的会话状态，不包含系统提示和审批许可。
 type Snapshot struct {
 	Messages []model.Message `json:"messages"`
 	Turns    int             `json:"turns"`
+	Goal     string          `json:"goal,omitempty"`
+	Status   RunStatus       `json:"status,omitempty"`
+}
+
+// RunOptions bounds one invocation. Zero values use the core defaults or mean
+// unlimited, so callers only need to specify the budgets they care about.
+type RunOptions struct {
+	MaxTurns  int
+	MaxTools  int
+	MaxTokens int
+	Timeout   time.Duration
 }
 
 // Capability 描述工具对环境的改动程度，由 Toolbox 声明。
@@ -97,6 +123,31 @@ type WorkspaceUndoer interface {
 	Undo() (string, error)
 }
 
+// CompletionVerifier lets the host confirm that the requested goal is really
+// satisfied. It is deliberately optional: existing Toolboxes keep the old
+// "no tool call means finished" behavior.
+//
+// The verifier should inspect the real environment (tests, files, external
+// state, etc.) rather than trusting the assistant's final text.
+type CompletionVerifier interface {
+	Verify(context.Context, string, []model.Message) (VerificationResult, error)
+}
+
+// VerificationResult is a structured report from the host/application.
+type VerificationResult struct {
+	Complete  bool
+	Evidence  string
+	Feedback  string
+	Retryable bool
+}
+
+// ToolConcurrency is an optional host declaration. Tools are serialized by
+// default; only a Toolbox that explicitly marks every call as parallel-safe
+// gets concurrent execution.
+type ToolConcurrency interface {
+	ParallelSafe(model.ToolCall) bool
+}
+
 // Agent 持有当前会话和完整认知循环。
 type Agent struct {
 	mu            sync.RWMutex
@@ -106,11 +157,14 @@ type Agent struct {
 	history       []model.Message
 	approved      map[string]bool
 	turns         int
+	goal          string
+	status        RunStatus
 	toolRuns      int
 	approvals     int
 	toolFailures  int
 	failureKey    string
 	failureStreak int
+	runMu         sync.Mutex
 }
 
 // DefaultSystem 是核心的通用行为提示。应用应在其上叠加产品身份与项目指令。
@@ -133,6 +187,7 @@ func New(provider model.Provider, tools Toolbox, system string) *Agent {
 		system:   message,
 		history:  []model.Message{message},
 		approved: map[string]bool{},
+		status:   StatusIdle,
 	}
 }
 
@@ -148,6 +203,8 @@ func (agent *Agent) Reset() {
 	agent.toolFailures = 0
 	agent.failureKey = ""
 	agent.failureStreak = 0
+	agent.goal = ""
+	agent.status = StatusIdle
 }
 
 // Stats reports current conversation size and activity without exposing message contents.
@@ -160,6 +217,8 @@ func (agent *Agent) Stats() Stats {
 		Tools:     agent.toolRuns,
 		Approvals: agent.approvals,
 		Failures:  agent.toolFailures,
+		Goal:      agent.goal,
+		Status:    agent.status,
 	}
 }
 
@@ -167,7 +226,7 @@ func (agent *Agent) Stats() Stats {
 func (agent *Agent) Snapshot() Snapshot {
 	agent.mu.RLock()
 	defer agent.mu.RUnlock()
-	return Snapshot{Messages: cloneMessages(agent.history[1:]), Turns: agent.turns}
+	return Snapshot{Messages: cloneMessages(agent.history[1:]), Turns: agent.turns, Goal: agent.goal, Status: agent.status}
 }
 
 // Restore replaces conversation state while intentionally clearing approvals.
@@ -176,6 +235,11 @@ func (agent *Agent) Restore(snapshot Snapshot) {
 	defer agent.mu.Unlock()
 	agent.history = append([]model.Message{agent.system}, cloneMessages(snapshot.Messages)...)
 	agent.turns = max(0, snapshot.Turns)
+	agent.goal = strings.TrimSpace(snapshot.Goal)
+	agent.status = snapshot.Status
+	if agent.status == "" {
+		agent.status = StatusIdle
+	}
 	agent.approved = map[string]bool{}
 	agent.toolRuns = 0
 	agent.approvals = 0
@@ -204,15 +268,85 @@ func (agent *Agent) UndoLastChange() (string, error) {
 
 // Run pursues one user input until the model finishes or the context is cancelled.
 func (agent *Agent) Run(runContext context.Context, input string, events chan<- Event, approvals <-chan ApprovalDecision) {
+	agent.run(runContext, input, true, RunOptions{MaxTurns: maxTurns}, false, events, approvals)
+}
+
+// RunWithOptions starts a goal with explicit budgets. Exhausting a budget
+// pauses the session instead of treating it as a failure.
+func (agent *Agent) RunWithOptions(runContext context.Context, input string, options RunOptions, events chan<- Event, approvals <-chan ApprovalDecision) {
+	agent.run(runContext, input, true, options, true, events, approvals)
+}
+
+// Resume continues the last checkpointed goal without appending a duplicate
+// user message. It is safe to call after Restore or process restart.
+func (agent *Agent) Resume(runContext context.Context, events chan<- Event, approvals <-chan ApprovalDecision) {
+	agent.resume(runContext, RunOptions{MaxTurns: maxTurns}, false, events, approvals)
+}
+
+// ResumeWithOptions continues a checkpointed goal with a fresh budget.
+func (agent *Agent) ResumeWithOptions(runContext context.Context, options RunOptions, events chan<- Event, approvals <-chan ApprovalDecision) {
+	agent.resume(runContext, options, true, events, approvals)
+}
+
+func (agent *Agent) resume(runContext context.Context, options RunOptions, pauseOnBudget bool, events chan<- Event, approvals <-chan ApprovalDecision) {
+	agent.mu.RLock()
+	goal := agent.goal
+	agent.mu.RUnlock()
+	if strings.TrimSpace(goal) == "" {
+		send(runContext, events, Event{Kind: Failed, Text: "No checkpointed goal to resume.", Failed: true})
+		return
+	}
+	agent.run(runContext, goal, false, options, pauseOnBudget, events, approvals)
+}
+
+func (agent *Agent) run(runContext context.Context, input string, appendInput bool, options RunOptions, pauseOnBudget bool, events chan<- Event, approvals <-chan ApprovalDecision) {
+	if !agent.runMu.TryLock() {
+		send(runContext, events, Event{Kind: Failed, Text: "Agent is already running.", Failed: true})
+		return
+	}
+	defer agent.runMu.Unlock()
 	input = strings.TrimSpace(input)
 	if input == "" {
 		send(runContext, events, Event{Kind: Finished})
 		return
 	}
-	agent.appendMessage(model.Message{Role: "user", Content: input})
+	if options.MaxTurns <= 0 {
+		options.MaxTurns = maxTurns
+	}
+	if options.Timeout > 0 {
+		var cancel context.CancelFunc
+		runContext, cancel = context.WithTimeout(runContext, options.Timeout)
+		defer cancel()
+	}
+	agent.mu.Lock()
+	if appendInput {
+		agent.history = append(agent.history, model.Message{Role: "user", Content: input})
+	}
+	agent.goal = input
+	agent.status = StatusRunning
+	agent.mu.Unlock()
+	defer func() {
+		agent.mu.Lock()
+		if agent.status == StatusPaused {
+			// A paused checkpoint is a successful, resumable outcome.
+		} else if runContext.Err() != nil {
+			agent.status = StatusFailed
+		} else if agent.status == StatusRunning {
+			agent.status = StatusFinished
+		}
+		agent.mu.Unlock()
+	}()
 
 	stalled := 0
-	for turn := 0; turn < maxTurns; turn++ {
+	toolsUsed := 0
+	tokensUsed := 0
+	pause := func(reason string) {
+		agent.mu.Lock()
+		agent.status = StatusPaused
+		agent.mu.Unlock()
+		send(runContext, events, Event{Kind: Paused, Text: reason})
+	}
+	for turn := 0; turn < options.MaxTurns; turn++ {
 		history := agent.startTurn()
 		reply, err := agent.provider.Complete(runContext, history, agent.toolDefinitions(), func(event model.StreamEvent) {
 			switch event.Kind {
@@ -225,25 +359,76 @@ func (agent *Agent) Run(runContext context.Context, input string, events chan<- 
 			}
 		})
 		if err != nil {
+			if pauseOnBudget && errors.Is(runContext.Err(), context.DeadlineExceeded) {
+				pause("Time budget exhausted.")
+				return
+			}
 			if errors.Is(err, context.Canceled) {
 				send(runContext, events, Event{Kind: Finished, Text: "Cancelled"})
 				return
 			}
+			agent.mu.Lock()
+			agent.status = StatusFailed
+			agent.mu.Unlock()
 			send(runContext, events, Event{Kind: Failed, Text: err.Error(), Failed: true})
 			return
 		}
 
 		agent.appendMessage(model.Message{Role: "assistant", Content: reply.Content, ToolCalls: reply.ToolCalls})
 		if reply.Usage.TotalTokens > 0 {
+			tokensUsed += reply.Usage.TotalTokens
 			send(runContext, events, Event{Kind: UsageChanged, Usage: reply.Usage})
 		}
 		send(runContext, events, Event{Kind: MessageDone})
 		if len(reply.ToolCalls) == 0 {
+			if verifier, ok := agent.tools.(CompletionVerifier); ok {
+				messages := agent.Snapshot().Messages
+				result, verifyErr := verifier.Verify(runContext, reply.Content, messages)
+				verified, feedback := result.Complete, result.Feedback
+				if feedback == "" {
+					feedback = result.Evidence
+				}
+				if verifyErr != nil {
+					feedback = "Completion verification failed: " + verifyErr.Error()
+					verified = false
+				}
+				if !verified {
+					feedback = strings.TrimSpace(feedback)
+					if feedback == "" {
+						feedback = "The goal has not been verified as complete. Continue investigating and take the necessary actions."
+					}
+					// This is an observation, not a new user request. Keeping it in
+					// history makes retries recoverable after a process restart.
+					agent.appendMessage(model.Message{Role: "tool", Content: feedback})
+					if !result.Retryable {
+						pause("Completion verification requires intervention: " + feedback)
+						return
+					}
+					if pauseOnBudget && options.MaxTokens > 0 && tokensUsed >= options.MaxTokens {
+						pause(fmt.Sprintf("Token budget exhausted after %d tokens.", tokensUsed))
+						return
+					}
+					continue
+				}
+			}
 			send(runContext, events, Event{Kind: Finished})
+			return
+		}
+		if pauseOnBudget && options.MaxTokens > 0 && tokensUsed >= options.MaxTokens {
+			pause(fmt.Sprintf("Token budget exhausted after %d tokens.", tokensUsed))
 			return
 		}
 
 		progressed := reply.Content != ""
+		// 先处理元工具和审批，再并行运行已经获准的普通工具。
+		// 这对应 JS 版本的 Promise.all：慢工具不会阻塞同一轮中的独立工具。
+		type toolResult struct {
+			call        model.ToolCall
+			preview     string
+			observation model.Observation
+			err         error
+		}
+		var pending []toolResult
 		for _, call := range reply.ToolCalls {
 			if handled, stop := agent.handleMeta(runContext, events, approvals, call); handled {
 				progressed = true
@@ -275,21 +460,58 @@ func (agent *Agent) Run(runContext context.Context, input string, events chan<- 
 				continue
 			}
 
-			send(runContext, events, Event{Kind: ToolStarted, Text: preview, Call: call})
-			observation, runErr := agent.tools.Execute(runContext, call)
-			agent.countToolRun(runErr != nil)
-			progressed = true
-			output := observation.Text
-			if runErr != nil {
-				output = strings.TrimSpace(output + "\nError: " + runErr.Error())
+			pending = append(pending, toolResult{call: call, preview: preview})
+		}
+
+		if pauseOnBudget && options.MaxTools > 0 && toolsUsed+len(pending) > options.MaxTools {
+			pause(fmt.Sprintf("Tool budget exhausted after %d calls.", toolsUsed))
+			return
+		}
+		toolsUsed += len(pending)
+		parallel := false
+		if policy, ok := agent.tools.(ToolConcurrency); ok && len(pending) > 1 {
+			parallel = true
+			for _, result := range pending {
+				if !policy.ParallelSafe(result.call) {
+					parallel = false
+					break
+				}
 			}
-			agent.appendMessage(model.Message{Role: "tool", ToolCallID: call.ID, Content: output, Images: observation.Images})
-			if agent.recordToolOutcome(call, output, runErr != nil) {
-				if agent.requestRepeatedFailureClarification(runContext, events, approvals, call, output) {
+		}
+		if parallel {
+			var group sync.WaitGroup
+			for index := range pending {
+				group.Add(1)
+				go func(result *toolResult) {
+					defer group.Done()
+					send(runContext, events, Event{Kind: ToolStarted, Text: result.preview, Call: result.call})
+					result.observation, result.err = agent.tools.Execute(runContext, result.call)
+					agent.countToolRun(result.err != nil)
+				}(&pending[index])
+			}
+			group.Wait()
+		} else {
+			for index := range pending {
+				result := &pending[index]
+				send(runContext, events, Event{Kind: ToolStarted, Text: result.preview, Call: result.call})
+				result.observation, result.err = agent.tools.Execute(runContext, result.call)
+				agent.countToolRun(result.err != nil)
+			}
+		}
+
+		for _, result := range pending {
+			progressed = true
+			output := result.observation.Text
+			if result.err != nil {
+				output = strings.TrimSpace(output + "\nError: " + result.err.Error())
+			}
+			agent.appendMessage(model.Message{Role: "tool", ToolCallID: result.call.ID, Content: output, Images: result.observation.Images})
+			if agent.recordToolOutcome(result.call, output, result.err != nil) {
+				if agent.requestRepeatedFailureClarification(runContext, events, approvals, result.call, output) {
 					return
 				}
 			}
-			send(runContext, events, Event{Kind: ToolDone, Text: output, Call: call, Failed: runErr != nil})
+			send(runContext, events, Event{Kind: ToolDone, Text: output, Call: result.call, Failed: result.err != nil})
 		}
 
 		if progressed {
@@ -303,7 +525,14 @@ func (agent *Agent) Run(runContext context.Context, input string, events chan<- 
 		}
 	}
 
-	send(runContext, events, Event{Kind: Failed, Text: fmt.Sprintf("Agent stopped after %d reasoning turns.", maxTurns), Failed: true})
+	if pauseOnBudget {
+		pause(fmt.Sprintf("Turn budget exhausted after %d reasoning turns.", options.MaxTurns))
+		return
+	}
+	agent.mu.Lock()
+	agent.status = StatusFailed
+	agent.mu.Unlock()
+	send(runContext, events, Event{Kind: Failed, Text: fmt.Sprintf("Agent stopped after %d reasoning turns.", options.MaxTurns), Failed: true})
 }
 
 // toolDefinitions returns the application's tools. The core owns no reserved names.
@@ -422,7 +651,7 @@ func send(runContext context.Context, events chan<- Event, event Event) {
 	if events == nil {
 		return
 	}
-	if event.Kind == Finished || event.Kind == Failed {
+	if event.Kind == Finished || event.Kind == Failed || event.Kind == Paused {
 		events <- event
 		return
 	}

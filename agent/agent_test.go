@@ -397,6 +397,60 @@ func TestWorkspaceCapabilitiesBridgeOptionalToolboxOperations(t *testing.T) {
 	}
 }
 
+func TestRunUsesOptionalCompletionVerifier(t *testing.T) {
+	provider := &fakeProvider{replies: []model.Reply{
+		{Content: "done"},
+		{Content: "fixed and done"},
+	}}
+	tools := &verifyingTools{}
+	brain := New(provider, tools, "test")
+	brain.Run(context.Background(), "finish the task", make(chan Event, 16), nil)
+	if provider.calls != 2 || tools.verifications != 2 {
+		t.Fatalf("expected a failed verification followed by a retry, calls=%d verifications=%d", provider.calls, tools.verifications)
+	}
+}
+
+func TestResumeContinuesCheckpointedGoalWithoutDuplicatingUserMessage(t *testing.T) {
+	provider := &fakeProvider{replies: []model.Reply{{Content: "continued"}}}
+	brain := New(provider, &fakeTools{}, "test")
+	brain.Restore(Snapshot{
+		Messages: []model.Message{{Role: "user", Content: "inspect the project"}},
+		Goal:     "inspect the project",
+		Status:   StatusRunning,
+	})
+	brain.Resume(context.Background(), make(chan Event, 8), nil)
+	snapshot := brain.Snapshot()
+	users := 0
+	for _, message := range snapshot.Messages {
+		if message.Role == "user" {
+			users++
+		}
+	}
+	if users != 1 || provider.calls != 1 || brain.Stats().Status != StatusFinished {
+		t.Fatalf("resume duplicated or did not finish: users=%d calls=%d status=%s", users, provider.calls, brain.Stats().Status)
+	}
+}
+
+func TestRunWithOptionsPausesAtBudgetAndCanResume(t *testing.T) {
+	provider := &fakeProvider{replies: []model.Reply{
+		{ToolCalls: []model.ToolCall{{ID: "call_1", Type: "function", Function: model.FunctionCall{Name: "read", Arguments: `{}`}}}},
+		{Content: "finished after resume"},
+	}}
+	brain := New(provider, &fakeTools{}, "test")
+	events := make(chan Event, 16)
+	approvals := make(chan ApprovalDecision, 1)
+	approvals <- ApprovalDecision{Approved: true}
+	brain.RunWithOptions(context.Background(), "long task", RunOptions{MaxTurns: 1}, events, approvals)
+	if brain.Stats().Status != StatusPaused {
+		t.Fatalf("status=%s, want paused", brain.Stats().Status)
+	}
+
+	brain.ResumeWithOptions(context.Background(), RunOptions{MaxTurns: 2}, events, nil)
+	if brain.Stats().Status != StatusFinished || provider.calls != 2 {
+		t.Fatalf("resume status=%s calls=%d", brain.Stats().Status, provider.calls)
+	}
+}
+
 type fakeProvider struct {
 	replies     []model.Reply
 	definitions []model.Tool
@@ -416,6 +470,19 @@ func (provider *fakeProvider) Complete(_ context.Context, _ []model.Message, def
 type fakeTools struct {
 	executed int
 	images   []model.Image
+}
+
+type verifyingTools struct {
+	fakeTools
+	verifications int
+}
+
+func (tools *verifyingTools) Verify(context.Context, string, []model.Message) (VerificationResult, error) {
+	tools.verifications++
+	if tools.verifications == 1 {
+		return VerificationResult{Feedback: "The expected output is missing.", Retryable: true}, nil
+	}
+	return VerificationResult{Complete: true, Evidence: "output exists"}, nil
 }
 
 func (tools *fakeTools) Definitions() []model.Tool { return nil }
