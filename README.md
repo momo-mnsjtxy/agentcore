@@ -59,3 +59,7 @@ Responses 是默认路径；传入其他协议名会走 Chat Completions 回退�
 - **Agentengine**：在 Agentcore 之上叠加交付工作流、任务台账和产出元工具，同时保留 `model` / `openai` 的同一 import 路径（type alias），下游代码无需改动。
 
 架构边界见 [DESIGN.md](DESIGN.md)。代码遵循 HOP（Human-Oriented Programming）。
+
+## 许可证
+
+本项目采用 [GNU Affero General Public License v3.0（AGPL-3.0-only）](LICENSE)。
